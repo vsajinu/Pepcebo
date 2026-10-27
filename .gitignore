@@ -1,0 +1,5 @@
+.env
+liftbot.db
+__pycache__/
+.venv/
+data/
