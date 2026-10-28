@@ -45,6 +45,20 @@ def init():
             );
             CREATE INDEX IF NOT EXISTS idx_lifts_user
                 ON lifts (guild_id, user_id, lift);
+            -- Rep sets live apart from lifts so estimated maxes never reach the rankings
+            CREATE TABLE IF NOT EXISTS sets (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id      INTEGER NOT NULL,
+                user_id       INTEGER NOT NULL,
+                lift          TEXT    NOT NULL,
+                weight_kg     REAL    NOT NULL,
+                reps          INTEGER NOT NULL,
+                e1rm_kg       REAL    NOT NULL,
+                bodyweight_kg REAL    NOT NULL,
+                logged_at     TEXT    NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_sets_user
+                ON sets (guild_id, user_id, lift);
             """
         )
         _migrate_lift_bodyweight(conn)
@@ -155,3 +169,48 @@ def all_bests() -> list:
     with connect() as conn:
         out = _profiles(conn)
     return [(user_id, entry) for (_, user_id), entry in out.items()]
+
+
+# The best estimated max for a lift and the set it came from
+Estimate = namedtuple("Estimate", "e1rm_kg weight_kg reps")
+
+
+def add_set(guild_id, user_id, lift, weight_kg, reps, e1rm_kg, bodyweight_kg):
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO sets (guild_id, user_id, lift, weight_kg, reps, e1rm_kg, bodyweight_kg, logged_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (guild_id, user_id, lift, weight_kg, reps, e1rm_kg, bodyweight_kg,
+             datetime.now(timezone.utc).isoformat()),
+        )
+
+
+def best_estimates(guild_id, user_id) -> dict:
+    """Returns {lift: Estimate} with the highest estimated max per lift."""
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT lift, e1rm_kg, weight_kg, reps FROM (
+                SELECT *, ROW_NUMBER() OVER (PARTITION BY lift ORDER BY e1rm_kg DESC) AS rn
+                FROM sets WHERE guild_id = ? AND user_id = ?
+            ) WHERE rn = 1
+            """,
+            (guild_id, user_id),
+        ).fetchall()
+    return {row["lift"]: Estimate(row["e1rm_kg"], row["weight_kg"], row["reps"]) for row in rows}
+
+
+def history(guild_id, user_id, lift):
+    """Returns (singles, sets) oldest first: [(logged_at, weight_kg)] and [(logged_at, e1rm_kg)]."""
+    with connect() as conn:
+        singles = conn.execute(
+            "SELECT logged_at, weight_kg FROM lifts WHERE guild_id = ? AND user_id = ? AND lift = ? "
+            "ORDER BY logged_at",
+            (guild_id, user_id, lift),
+        ).fetchall()
+        sets = conn.execute(
+            "SELECT logged_at, e1rm_kg FROM sets WHERE guild_id = ? AND user_id = ? AND lift = ? "
+            "ORDER BY logged_at",
+            (guild_id, user_id, lift),
+        ).fetchall()
+    return [tuple(r) for r in singles], [tuple(r) for r in sets]

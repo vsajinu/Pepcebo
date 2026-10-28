@@ -1,13 +1,16 @@
 # Pepcebo
 
-Pepcebo is a Discord bot for tracking powerlifting PRs. You log your squat, bench, and deadlift, and it works out your total and IPF GL points. It can also rank you against people in your server, everyone using the bot, or real lifters from IPF meets in your weight class.
+Pepcebo is a Discord bot for tracking powerlifting PRs. You log your squat, bench, and deadlift, and it works out your total and IPF GL points. It can also put you on leaderboards against people in your server, everyone using the bot, or real lifters from IPF meets in your weight class.
 
 ## Commands
 
 - `/setup` saves your sex, bodyweight, and unit (lb or kg). Run it again whenever your bodyweight changes.
-- `/pr` logs a lift. If it beats your old best, the bot announces it as a PR.
-- `/stats` shows your bests, total, GL points, and bodyweight. You can pass a member to see someone else's.
-- `/rankings` shows a top 10. The scope can be `server`, `global`, or `ipf`, and the category can be total or a single lift.
+- `/pr` logs a single (1 rep max). If it beats your old best, the bot announces it as a PR.
+- `/set` logs a rep set like `225 x 5` and estimates your max from it (see below).
+- `/stats` shows your bests, estimated maxes, total, GL points, rank, and bodyweight. You can pass a member to see someone else's.
+- `/history` sends a chart of one lift over time, with your logged singles and your estimated maxes as separate lines.
+- `/leaderboard` shows a top 10. The scope can be `server`, `global`, or `ipf`, and the category can be total or a single lift.
+- `/ranking` shows your rank tier (Bronze up to Ascender) and how far you are from the next one.
 - `/faq` explains how everything works, including the GL formula.
 
 ## How scoring works
@@ -16,7 +19,27 @@ GL points are the IPF's formula for comparing lifters at different bodyweights. 
 
 Every lift saves the bodyweight you had when you logged it. That way, if you cut or bulk later, your old lifts keep their original GL points. Since your three best lifts might come from different days, your total gets scored at the heaviest of those bodyweights. That's closer to a real meet where you weigh in once, and it means you can't log a squat at 100 kg, cut to 70 kg, and have the squat count as a 70 kg lift.
 
-The IPF rankings come from the [OpenIPF](https://www.openipf.org) data. They only use raw full-power meets and each lifter's best result in a weight class. Meet lifts are judged and gym lifts aren't, so it's a rough comparison.
+## Estimated maxes
+
+`/set` uses the Epley formula, `weight × (1 + reps / 30)`, so 225 × 5 comes out to about 262. It accepts up to 20 reps, though estimates get shaky past about 10. Sets are stored in their own table, apart from your singles, so estimates show up in `/stats` and `/history` but never count toward leaderboards or ranks. A set of 1 is just a single, so it gets logged the same way `/pr` does.
+
+## Rank tiers
+
+`/ranking` places you by the GL points of your best total, using logged singles only:
+
+| Tier | GL |
+| --- | --- |
+| 🟤 Bronze | under 45 |
+| ⚪ Silver | 45–60 |
+| 🟡 Gold | 60–70 |
+| 💠 Platinum | 70–80 |
+| 💎 Diamond | 80–90 |
+| 👑 Grandmaster | 90–100 |
+| 🌌 Ascender | 100+ |
+
+For a sense of scale, a 90 kg man totaling 600 kg scores about 80 GL. The tier floors are in `TIERS` in [scoring.py](scoring.py) if you want to move them.
+
+The IPF leaderboard comes from the [OpenIPF](https://www.openipf.org) data. They only use raw full-power meets and each lifter's best result in a weight class. Meet lifts are judged and gym lifts aren't, so it's a rough comparison.
 
 ## Running it yourself
 
@@ -37,11 +60,12 @@ python ipf_data.py
 python bot.py
 ```
 
-`ipf_data.py` downloads around 70 MB and builds `data/ipf_stats.json`, so it takes a minute. Rerun it whenever you want fresher rankings. The bot works without it, but `/rankings scope:ipf` won't.
+`ipf_data.py` downloads around 70 MB and builds `data/ipf_stats.json`, so it takes a minute. Rerun it whenever you want fresher rankings. The bot works without it, but `/leaderboard scope:ipf` won't.
 
 ## Files
 
 - [bot.py](bot.py) has the slash commands.
 - [db.py](db.py) handles the SQLite database (`liftbot.db`, created on first run).
-- [scoring.py](scoring.py) has the GL formula and unit conversion.
+- [scoring.py](scoring.py) has the GL formula, Epley estimates, rank tiers, and unit conversion.
+- [charts.py](charts.py) draws the `/history` charts with matplotlib.
 - [ipf_data.py](ipf_data.py) builds the IPF weight class rankings.

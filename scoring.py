@@ -24,3 +24,37 @@ def gl_points(total_kg: float, bodyweight_kg: float, sex: str) -> float:
     a, b, c = MALE if sex == "male" else FEMALE
     bw = max(bodyweight_kg, MIN_BW)
     return total_kg * 100 / (a - b * math.exp(-c * bw))
+
+
+def total_for_gl(gl: float, bodyweight_kg: float, sex: str) -> float:
+    """The total (kg) that scores the given GL at this bodyweight."""
+    a, b, c = MALE if sex == "male" else FEMALE
+    bw = max(bodyweight_kg, MIN_BW)
+    return gl * (a - b * math.exp(-c * bw)) / 100
+
+
+# Epley gets shaky past this many reps
+MAX_REPS = 20
+
+
+def epley(weight: float, reps: int) -> float:
+    """Estimated 1 rep max from a set. A single is already a max."""
+    return weight if reps == 1 else weight * (1 + reps / 30)
+
+
+# Rank tiers by GL: (name, emoji, embed color, minimum GL)
+TIERS = (
+    ("Bronze", "🟤", 0xA0632B, 0),
+    ("Silver", "⚪", 0xA8B0B8, 45),
+    ("Gold", "🟡", 0xE5B53A, 60),
+    ("Platinum", "💠", 0x4FC1C9, 70),
+    ("Diamond", "💎", 0x5B8DEF, 80),
+    ("Grandmaster", "👑", 0xC0392B, 90),
+    ("Ascender", "🌌", 0x9B59B6, 100),
+)
+
+
+def tier(gl: float):
+    """Returns (tier, next tier or None) for a GL score."""
+    index = max(i for i, t in enumerate(TIERS) if gl >= t[3])
+    return TIERS[index], TIERS[index + 1] if index + 1 < len(TIERS) else None
