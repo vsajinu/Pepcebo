@@ -59,9 +59,21 @@ def init():
             );
             CREATE INDEX IF NOT EXISTS idx_sets_user
                 ON sets (guild_id, user_id, lift);
+            -- Every bodyweight change, for the /setting graph
+            CREATE TABLE IF NOT EXISTS bodyweights (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id      INTEGER NOT NULL,
+                user_id       INTEGER NOT NULL,
+                bodyweight_kg REAL    NOT NULL,
+                logged_at     TEXT    NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_bodyweights_user
+                ON bodyweights (guild_id, user_id);
             """
         )
         _migrate_lift_bodyweight(conn)
+        _migrate_formula(conn)
+        _seed_bodyweights(conn)
 
 
 def _migrate_lift_bodyweight(conn):
@@ -80,8 +92,46 @@ def _migrate_lift_bodyweight(conn):
     )
 
 
+def _migrate_formula(conn):
+    # Scoring formula preference, added after launch. Everyone starts on GL.
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(lifters)")}
+    if "formula" not in columns:
+        conn.execute("ALTER TABLE lifters ADD COLUMN formula TEXT NOT NULL DEFAULT 'gl'")
+
+
+def _seed_bodyweights(conn):
+    # Lifters from before bodyweight history start with their current bodyweight, dated at their first lift
+    conn.execute(
+        """
+        INSERT INTO bodyweights (guild_id, user_id, bodyweight_kg, logged_at)
+        SELECT l.guild_id, l.user_id, l.bodyweight_kg, COALESCE(
+            (SELECT MIN(logged_at) FROM lifts x WHERE x.guild_id = l.guild_id AND x.user_id = l.user_id), ?
+        )
+        FROM lifters l
+        WHERE NOT EXISTS (
+            SELECT 1 FROM bodyweights b WHERE b.guild_id = l.guild_id AND b.user_id = l.user_id
+        )
+        """,
+        (datetime.now(timezone.utc).isoformat(),),
+    )
+
+
+def _log_bodyweight(conn, guild_id, user_id, bodyweight_kg):
+    # Only when it changed, so rerunning /setup doesn't stack up duplicate points
+    last = conn.execute(
+        "SELECT bodyweight_kg FROM bodyweights WHERE guild_id = ? AND user_id = ? ORDER BY id DESC LIMIT 1",
+        (guild_id, user_id),
+    ).fetchone()
+    if last is None or abs(last["bodyweight_kg"] - bodyweight_kg) > 1e-6:
+        conn.execute(
+            "INSERT INTO bodyweights (guild_id, user_id, bodyweight_kg, logged_at) VALUES (?, ?, ?, ?)",
+            (guild_id, user_id, bodyweight_kg, datetime.now(timezone.utc).isoformat()),
+        )
+
+
 def upsert_lifter(guild_id, user_id, sex, bodyweight_kg, unit):
     with connect() as conn:
+        _log_bodyweight(conn, guild_id, user_id, bodyweight_kg)
         conn.execute(
             """
             INSERT INTO lifters (guild_id, user_id, sex, bodyweight_kg, unit)
@@ -93,6 +143,33 @@ def upsert_lifter(guild_id, user_id, sex, bodyweight_kg, unit):
             """,
             (guild_id, user_id, sex, bodyweight_kg, unit),
         )
+
+
+def update_settings(guild_id, user_id, bodyweight_kg=None, unit=None, formula=None):
+    """Change any of bodyweight, unit, or formula on an existing profile. None leaves it as is."""
+    with connect() as conn:
+        if bodyweight_kg is not None:
+            _log_bodyweight(conn, guild_id, user_id, bodyweight_kg)
+        conn.execute(
+            """
+            UPDATE lifters SET
+                bodyweight_kg = COALESCE(?, bodyweight_kg),
+                unit = COALESCE(?, unit),
+                formula = COALESCE(?, formula)
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (bodyweight_kg, unit, formula, guild_id, user_id),
+        )
+
+
+def bodyweight_history(guild_id, user_id):
+    """Returns [(logged_at, bodyweight_kg)], oldest first."""
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT logged_at, bodyweight_kg FROM bodyweights WHERE guild_id = ? AND user_id = ? ORDER BY id",
+            (guild_id, user_id),
+        ).fetchall()
+    return [tuple(r) for r in rows]
 
 
 def get_lifter(guild_id, user_id):

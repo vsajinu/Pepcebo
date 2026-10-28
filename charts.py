@@ -1,4 +1,4 @@
-"""Progress charts for /history, rendered with matplotlib to a PNG."""
+"""Progress charts for /history and /setting, rendered with matplotlib to a PNG."""
 
 import io
 from datetime import datetime, timedelta
@@ -19,16 +19,25 @@ ESTIMATE_COLOR = "#d95926"
 
 
 def history_chart(title: str, unit: str, singles, estimates) -> io.BytesIO:
-    """singles and estimates are [(iso timestamp, weight in unit)], oldest first."""
+    """singles and estimates are [(iso timestamp, weight in unit)], oldest first. Labels the best point."""
+    return _line_chart(title, unit, (
+        (singles, "Logged 1RM", TRUE_COLOR, "-", TRUE_COLOR),
+        (estimates, "Estimated 1RM (Epley)", ESTIMATE_COLOR, "--", SURFACE),
+    ), label_latest=False)
+
+
+def bodyweight_chart(title: str, unit: str, weights) -> io.BytesIO:
+    """weights is [(iso timestamp, bodyweight in unit)], oldest first. Labels the current bodyweight."""
+    return _line_chart(title, unit, ((weights, None, TRUE_COLOR, "-", TRUE_COLOR),), label_latest=True)
+
+
+def _line_chart(title: str, unit: str, series, label_latest: bool) -> io.BytesIO:
+    """series is ((points, legend label or None, color, line style, marker fill), ...)."""
     fig, ax = plt.subplots(figsize=(8, 4.5), dpi=150)
     fig.patch.set_facecolor(SURFACE)
     ax.set_facecolor(SURFACE)
 
-    series = (
-        (singles, "Logged 1RM", TRUE_COLOR, "-", TRUE_COLOR),
-        (estimates, "Estimated 1RM (Epley)", ESTIMATE_COLOR, "--", SURFACE),
-    )
-    best = None
+    marked = None
     all_dates = []
     for points, label, color, style, fill in series:
         if not points:
@@ -38,13 +47,13 @@ def history_chart(title: str, unit: str, singles, estimates) -> io.BytesIO:
         all_dates += dates
         ax.plot(dates, weights, style, color=color, linewidth=2, marker="o", markersize=7,
                 markerfacecolor=fill, markeredgecolor=color, markeredgewidth=2, label=label)
-        top = max(range(len(weights)), key=weights.__getitem__)
-        if best is None or weights[top] > best[1]:
-            best = (dates[top], weights[top])
+        pick = len(weights) - 1 if label_latest else max(range(len(weights)), key=weights.__getitem__)
+        if marked is None or label_latest or weights[pick] > marked[1]:
+            marked = (dates[pick], weights[pick])
 
-    # Label only the best point
-    if best:
-        ax.annotate(f"{best[1]:.1f} {unit}", best, textcoords="offset points", xytext=(0, 10),
+    # Label just one point: the best, or the latest for bodyweight
+    if marked:
+        ax.annotate(f"{marked[1]:.1f} {unit}", marked, textcoords="offset points", xytext=(0, 10),
                     ha="center", color=TEXT, fontsize=10, fontweight="bold")
 
     ax.set_title(title, color=TEXT, fontsize=14, loc="left", pad=12)
@@ -58,7 +67,8 @@ def history_chart(title: str, unit: str, singles, estimates) -> io.BytesIO:
     ax.margins(x=0.05, y=0.15)
     if max(all_dates) - min(all_dates) < timedelta(days=2):  # too short a span for date ticks
         ax.set_xlim(min(all_dates) - timedelta(days=3), max(all_dates) + timedelta(days=3))
-    ax.legend(loc="lower right", frameon=False, labelcolor=TEXT_MUTED)
+    if any(label for _, label, *_ in series):
+        ax.legend(loc="lower right", frameon=False, labelcolor=TEXT_MUTED)
 
     fig.tight_layout()
     buf = io.BytesIO()

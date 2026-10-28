@@ -1,4 +1,5 @@
-"""Pepcebo, a lift tracker Discord bot: log PRs, see totals and IPF GL points, rep set estimates, progress charts, leaderboards, and rank tiers."""
+"""Pepcebo, a lift tracker Discord bot: log PRs, see totals with IPF GL or DOTS points, rep set estimates,
+progress charts, leaderboards, rank tiers, and meet attempt and 1 rep max calculators."""
 
 import asyncio
 import os
@@ -13,7 +14,7 @@ import charts
 import db
 import ipf_data
 import scoring
-from scoring import epley, from_kg, gl_points, tier, to_kg, total_for_gl
+from scoring import FORMULAS, epley, from_kg, points, tier, to_kg, total_for_points
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -25,8 +26,36 @@ LIFTS = ("squat", "bench", "deadlift")
 SET_PATTERN = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*[x×*]\s*(\d+)\s*$", re.IGNORECASE)
 
 
+# Short score labels, like "82.3 GL"
+SCORE_LABEL = {"gl": "GL", "dots": "DOTS"}
+GRAPHS = ("bodyweight",) + LIFTS
+
+
 def fmt(kg: float, unit: str) -> str:
     return f"{from_kg(kg, unit):.1f} {unit}"
+
+
+def viewer_prefs(interaction: discord.Interaction):
+    """(unit, formula) of whoever ran the command, so numbers show the way they chose."""
+    viewer = db.get_lifter(interaction.guild_id, interaction.user.id)
+    return (viewer["unit"], viewer["formula"]) if viewer else ("kg", "gl")
+
+
+def graph_data(guild_id, user_id, graph: str, unit: str):
+    """Series for a progress graph, converted to the unit, or None if nothing's logged."""
+    if graph == "bodyweight":
+        series = (db.bodyweight_history(guild_id, user_id),)
+    else:
+        series = db.history(guild_id, user_id, graph)
+    if not any(series):
+        return None
+    return [[(t, from_kg(kg, unit)) for t, kg in pts] for pts in series]
+
+
+async def graph_file(title: str, graph: str, unit: str, data) -> discord.File:
+    draw = charts.bodyweight_chart if graph == "bodyweight" else charts.history_chart
+    image = await asyncio.to_thread(draw, title, unit, *data)
+    return discord.File(image, filename=f"{graph}_history.png")
 
 
 def best_total(bests: dict):
@@ -62,7 +91,7 @@ bot = LiftBot()
 
 @bot.tree.command(name="setup", description="Set your sex, bodyweight, and preferred unit")
 @app_commands.guild_only()
-@app_commands.describe(sex="Used for the IPF GL formula", bodyweight="Your current bodyweight", unit="lb or kg")
+@app_commands.describe(sex="Used by the GL and DOTS formulas", bodyweight="Your current bodyweight", unit="lb or kg")
 async def setup(
     interaction: discord.Interaction,
     sex: Literal["male", "female"],
@@ -71,7 +100,8 @@ async def setup(
 ):
     db.upsert_lifter(interaction.guild_id, interaction.user.id, sex, to_kg(bodyweight, unit), unit)
     await interaction.response.send_message(
-        f"Saved: {sex}, {bodyweight:g} {unit}. Log a lift with `/pr`.", ephemeral=True
+        f"Saved: {sex}, {bodyweight:g} {unit}. Log a lift with `/pr`. "
+        "Use `/setting` later to update your bodyweight or switch to DOTS.", ephemeral=True
     )
 
 
@@ -161,26 +191,239 @@ async def history(
         await interaction.response.send_message(f"{target.display_name} hasn't run `/setup` yet.", ephemeral=True)
         return
 
-    singles, sets = db.history(interaction.guild_id, target.id, lift)
-    if not singles and not sets:
+    # Chart in the viewer's unit so it matches what they're used to reading
+    unit = viewer_prefs(interaction)[0] if member else lifter["unit"]
+    data = graph_data(interaction.guild_id, target.id, lift, unit)
+    if data is None:
         await interaction.response.send_message(
             f"{target.display_name} hasn't logged a {lift} yet. Use `/pr` or `/set`.", ephemeral=True
         )
         return
 
-    # Chart in the viewer's unit so it matches what they're used to reading
-    viewer = db.get_lifter(interaction.guild_id, interaction.user.id)
-    unit = viewer["unit"] if viewer else lifter["unit"]
-    singles = [(t, from_kg(kg, unit)) for t, kg in singles]
-    sets = [(t, from_kg(kg, unit)) for t, kg in sets]
-
     await interaction.response.defer()
     title = f"{target.display_name} — {lift.title()}"
-    image = await asyncio.to_thread(charts.history_chart, title, unit, singles, sets)
-    await interaction.followup.send(file=discord.File(image, filename=f"{lift}_history.png"))
+    await interaction.followup.send(file=await graph_file(title, lift, unit, data))
 
 
-@bot.tree.command(name="stats", description="Show best lifts, total, and IPF GL points")
+def settings_embed(user: discord.abc.User, lifter, note: Optional[str] = None) -> discord.Embed:
+    unit = lifter["unit"]
+    embed = discord.Embed(
+        title=f"{user.display_name}'s settings",
+        description=note or "Change anything below, or pick a graph to see your progress.",
+        color=discord.Color.gold(),
+    )
+    embed.add_field(name="Bodyweight", value=fmt(lifter["bodyweight_kg"], unit))
+    embed.add_field(name="Unit", value=unit)
+    embed.add_field(name="Scoring", value=FORMULAS[lifter["formula"]])
+    embed.add_field(name="Sex", value=lifter["sex"])
+    embed.set_footer(text="Sex can be changed with /setup. Old lifts keep the bodyweight they were logged at.")
+    return embed
+
+
+class BodyweightModal(discord.ui.Modal, title="Update bodyweight"):
+    def __init__(self, panel: "SettingsView", unit: str):
+        super().__init__()
+        self.panel = panel
+        self.unit = unit
+        self.bodyweight = discord.ui.TextInput(label=f"New bodyweight ({unit})", placeholder="e.g. 185.5", max_length=6)
+        self.add_item(self.bodyweight)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            value = float(self.bodyweight.value.strip())
+        except ValueError:
+            value = 0
+        if not 50 <= value <= 700:
+            await interaction.response.send_message(f"Enter a bodyweight from 50 to 700 {self.unit}.", ephemeral=True)
+            return
+        db.update_settings(interaction.guild_id, interaction.user.id, bodyweight_kg=to_kg(value, self.unit))
+        await self.panel.refresh(interaction, f"✅ Bodyweight set to {value:g} {self.unit}.")
+
+
+class SettingsView(discord.ui.View):
+    """The /setting panel. It's ephemeral, so only the person who opened it can use it."""
+
+    def __init__(self, origin: discord.Interaction, lifter):
+        super().__init__(timeout=600)
+        self.origin = origin
+        self.mark_current(lifter)
+
+    def mark_current(self, lifter):
+        for option in self.pick_formula.options:
+            option.default = option.value == lifter["formula"]
+        for option in self.pick_unit.options:
+            option.default = option.value == lifter["unit"]
+
+    async def refresh(self, interaction: discord.Interaction, note: str):
+        lifter = db.get_lifter(interaction.guild_id, interaction.user.id)
+        self.mark_current(lifter)
+        await interaction.response.edit_message(embed=settings_embed(interaction.user, lifter, note), view=self)
+
+    @discord.ui.button(label="Update bodyweight", emoji="⚖️", style=discord.ButtonStyle.primary, row=0)
+    async def update_bodyweight(self, interaction: discord.Interaction, button: discord.ui.Button):
+        lifter = db.get_lifter(interaction.guild_id, interaction.user.id)
+        await interaction.response.send_modal(BodyweightModal(self, lifter["unit"]))
+
+    @discord.ui.select(placeholder="Scoring formula", row=1, options=[
+        discord.SelectOption(label="IPF GL (default)", value="gl", description="The IPF's official formula"),
+        discord.SelectOption(label="DOTS", value="dots", description="Popular in many non-IPF federations"),
+    ])
+    async def pick_formula(self, interaction: discord.Interaction, select: discord.ui.Select):
+        db.update_settings(interaction.guild_id, interaction.user.id, formula=select.values[0])
+        await self.refresh(interaction, f"✅ Scores, ranks, and leaderboards now use {FORMULAS[select.values[0]]}.")
+
+    @discord.ui.select(placeholder="Unit", row=2, options=[
+        discord.SelectOption(label="lb", value="lb"),
+        discord.SelectOption(label="kg", value="kg"),
+    ])
+    async def pick_unit(self, interaction: discord.Interaction, select: discord.ui.Select):
+        db.update_settings(interaction.guild_id, interaction.user.id, unit=select.values[0])
+        await self.refresh(interaction, f"✅ Weights now show in {select.values[0]}.")
+
+    @discord.ui.select(placeholder="📈 Show a progress graph…", row=3, options=[
+        discord.SelectOption(label=graph.title(), value=graph, emoji="⚖️" if graph == "bodyweight" else "🏋️")
+        for graph in GRAPHS
+    ])
+    async def pick_graph(self, interaction: discord.Interaction, select: discord.ui.Select):
+        graph = select.values[0]
+        lifter = db.get_lifter(interaction.guild_id, interaction.user.id)
+        data = graph_data(interaction.guild_id, interaction.user.id, graph, lifter["unit"])
+        if data is None:
+            await interaction.response.send_message(f"You haven't logged a {graph} yet.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        title = f"{interaction.user.display_name} — {graph.title()}"
+        await interaction.followup.send(file=await graph_file(title, graph, lifter["unit"], data), ephemeral=True)
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        try:
+            await self.origin.edit_original_response(view=self)
+        except discord.HTTPException:
+            pass
+
+
+@bot.tree.command(name="setting", description="Update your bodyweight, unit, or scoring formula, and see progress graphs")
+@app_commands.guild_only()
+async def setting(interaction: discord.Interaction):
+    lifter = db.get_lifter(interaction.guild_id, interaction.user.id)
+    if lifter is None:
+        await interaction.response.send_message("Run `/setup` first.", ephemeral=True)
+        return
+    await interaction.response.send_message(
+        embed=settings_embed(interaction.user, lifter), view=SettingsView(interaction, lifter), ephemeral=True
+    )
+
+
+# Typical share of the total when someone hasn't logged all three lifts
+DEFAULT_SPLIT = {"squat": 0.35, "bench": 0.25, "deadlift": 0.40}
+
+
+@bot.tree.command(name="attempts", description="Suggested 1st, 2nd, and 3rd meet attempts for a target total or lift")
+@app_commands.describe(
+    lift="A single lift, or total to plan all three",
+    target="What you want to hit on your 3rd attempt. Leave empty to use your logged best",
+    unit="Defaults to your unit from /setup",
+)
+async def attempts(
+    interaction: discord.Interaction,
+    lift: Literal["total", "squat", "bench", "deadlift"],
+    target: Optional[app_commands.Range[float, 1, 5000]] = None,
+    unit: Optional[Literal["lb", "kg"]] = None,
+):
+    lifter = db.get_lifter(interaction.guild_id, interaction.user.id) if interaction.guild_id else None
+    unit = unit or (lifter["unit"] if lifter else "kg")
+    bests = db.best_lifts(interaction.guild_id, interaction.user.id) if lifter else {}
+    source = "your target"
+
+    if target is None:
+        if lift == "total" and best_total(bests):
+            target, source = from_kg(best_total(bests)[0], unit), "your best total"
+        elif lift in bests:
+            target, source = from_kg(bests[lift].weight_kg, unit), f"your {lift} PR"
+        else:
+            estimate = db.best_estimates(interaction.guild_id, interaction.user.id).get(lift) if lifter else None
+            if estimate is None:
+                await interaction.response.send_message(
+                    "Give a `target`, or log your lifts with `/pr` first.", ephemeral=True
+                )
+                return
+            target, source = from_kg(estimate.e1rm_kg, unit), f"your estimated {lift} max"
+
+    if lift == "total":
+        # Split the total the way the lifter's own bests are split, or a typical split if they're missing
+        if best_total(bests):
+            split = {l: bests[l].weight_kg / best_total(bests)[0] for l in LIFTS}
+            split_note = "split like your current bests"
+        else:
+            split = DEFAULT_SPLIT
+            split_note = "split 35% squat, 25% bench, 40% deadlift"
+        plan = {l: scoring.attempts(target * split[l], unit) for l in LIFTS}
+    else:
+        plan = {lift: scoring.attempts(target, unit)}
+        split_note = None
+
+    first, second, third = (f"{p:.0%}" for p in scoring.ATTEMPT_PERCENTS)
+    embed = discord.Embed(
+        title=f"Attempts for a {target:g} {unit} {lift}",
+        description=f"Based on {source}. Opener ≈ {first} (one you can hit on a bad day), "
+                    f"second ≈ {second}, third = {third}." + (f"\nTotal {split_note}." if split_note else ""),
+        color=discord.Color.gold(),
+    )
+    for name, (a1, a2, a3) in plan.items():
+        embed.add_field(name=name.title(), value=f"1st: **{a1:g}**\n2nd: **{a2:g}**\n3rd: **{a3:g}** {unit}")
+    if lift == "total":
+        embed.add_field(
+            name="If you go 9 for 9",
+            value=f"**{sum(p[2] for p in plan.values()):g} {unit}** total "
+                  f"(openers alone: {sum(p[0] for p in plan.values()):g} {unit})",
+            inline=False,
+        )
+    embed.set_footer(text=f"Rounded to {scoring.INCREMENT[unit]:g} {unit} jumps. Openers round down.")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="1rm", description="Estimate a 1 rep max from a working set with standard formulas")
+@app_commands.describe(weight="Weight on the bar", reps="Reps you got", unit="Defaults to your unit from /setup")
+async def one_rm(
+    interaction: discord.Interaction,
+    weight: app_commands.Range[float, 1, 2000],
+    reps: app_commands.Range[int, 1, 20],
+    unit: Optional[Literal["lb", "kg"]] = None,
+):
+    if unit is None:
+        lifter = db.get_lifter(interaction.guild_id, interaction.user.id) if interaction.guild_id else None
+        unit = lifter["unit"] if lifter else "kg"
+
+    estimates = scoring.one_rm_estimates(weight, reps)
+    average = sum(estimates.values()) / len(estimates)
+    embed = discord.Embed(
+        title=f"{weight:g} {unit} × {reps} → about {average:.1f} {unit}",
+        description="Average of the formulas below. They agree best at 10 reps or fewer.",
+        color=discord.Color.gold(),
+    )
+    embed.add_field(
+        name="Formulas",
+        value="\n".join(f"{name}: **{value:.1f}**" for name, value in estimates.items()),
+    )
+    # What that max says you could do for reps, using Epley backwards
+    embed.add_field(
+        name="Rep maxes",
+        value="\n".join(
+            f"{r} rep{'s' if r > 1 else ''}: **{average / (1 + r / 30) if r > 1 else average:.1f}**"
+            for r in (1, 2, 3, 5, 8, 10, 12)
+        ),
+    )
+    embed.add_field(
+        name="Training percentages",
+        value="\n".join(f"{pct}%: **{average * pct / 100:.1f}**" for pct in (95, 90, 85, 80, 75, 70)),
+    )
+    embed.set_footer(text=f"All in {unit}. This doesn't log anything; use /set to save a set.")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="stats", description="Show best lifts, total, points, and rank")
 @app_commands.guild_only()
 async def stats(interaction: discord.Interaction, member: Optional[discord.Member] = None):
     target = member or interaction.user
@@ -190,6 +433,7 @@ async def stats(interaction: discord.Interaction, member: Optional[discord.Membe
         return
 
     unit = lifter["unit"]
+    formula = viewer_prefs(interaction)[1]
     bests = db.best_lifts(interaction.guild_id, target.id)
     embed = discord.Embed(title=f"{target.display_name}'s lifts", color=discord.Color.gold())
     for lift in LIFTS:
@@ -198,14 +442,14 @@ async def stats(interaction: discord.Interaction, member: Optional[discord.Membe
     result = best_total(bests)
     if result:
         total, bodyweight = result
-        score = gl_points(total, bodyweight, lifter["sex"])
+        score = points(total, bodyweight, lifter["sex"], formula)
         embed.add_field(name="Total", value=fmt(total, unit))
-        embed.add_field(name="IPF GL", value=f"{score:.1f} (at {fmt(bodyweight, unit)})")
-        (name, emoji, color, _), _ = tier(score)
+        embed.add_field(name=FORMULAS[formula], value=f"{score:.1f} (at {fmt(bodyweight, unit)})")
+        (name, emoji, color, _), _ = tier(score, formula)
         embed.add_field(name="Rank", value=f"{emoji} {name}")
         embed.color = discord.Color(color)
     else:
-        embed.set_footer(text="Log all three lifts to get a total, IPF GL score, and rank.")
+        embed.set_footer(text=f"Log all three lifts to get a total, {FORMULAS[formula]} score, and rank.")
     embed.add_field(name="Bodyweight", value=fmt(lifter["bodyweight_kg"], unit))
 
     estimates = db.best_estimates(interaction.guild_id, target.id)
@@ -224,13 +468,13 @@ async def stats(interaction: discord.Interaction, member: Optional[discord.Membe
 @bot.tree.command(name="leaderboard", description="Leaderboard for this server, all bot users, or IPF lifters")
 @app_commands.guild_only()
 @app_commands.describe(
-    scope="server = this server, global = all Pepcebo users, ipf = all-time raw IPF lifters in your class",
+    scope="server = this server, global = all Pepcebo users, professional = raw IPF meet lifters in your class",
     category="Total or a single lift",
-    member="IPF only: compare someone else instead of you",
+    member="Professional only: compare someone else instead of you",
 )
 async def leaderboard(
     interaction: discord.Interaction,
-    scope: Literal["server", "global", "ipf"],
+    scope: Literal["server", "global", "professional"],
     category: Literal["total", "squat", "bench", "deadlift"] = "total",
     member: Optional[discord.Member] = None,
 ):
@@ -243,9 +487,9 @@ async def leaderboard(
 
 
 async def bot_leaderboard(interaction: discord.Interaction, category: str, profiles, label: str):
-    """Leaderboard of bot users: total by IPF GL points, single lifts by weight."""
-    viewer = db.get_lifter(interaction.guild_id, interaction.user.id)
-    unit = viewer["unit"] if viewer else "kg"
+    """Leaderboard of bot users: total by the viewer's points formula, single lifts by weight."""
+    unit, formula = viewer_prefs(interaction)
+    label_points = SCORE_LABEL[formula]
 
     ranked = []
     for user_id, data in profiles:
@@ -254,7 +498,7 @@ async def bot_leaderboard(interaction: discord.Interaction, category: str, profi
             result = best_total(bests)
             if result:
                 total, bodyweight = result
-                ranked.append((gl_points(total, bodyweight, data["sex"]), total, user_id))
+                ranked.append((points(total, bodyweight, data["sex"], formula), total, user_id))
         elif category in bests:
             weight = bests[category].weight_kg
             ranked.append((weight, weight, user_id))
@@ -285,9 +529,10 @@ async def bot_leaderboard(interaction: discord.Interaction, category: str, profi
 
     medals = ["🥇", "🥈", "🥉"]
     if category == "total":
-        title = f"{label} Leaderboard — Total (IPF GL)"
+        title = f"{label} Leaderboard — Total ({FORMULAS[formula]})"
         lines = [
-            f"{medals[i] if i < 3 else f'`{i + 1}.`'} {names[uid]} — **{score:.1f}** GL {tier(score)[0][1]} "
+            f"{medals[i] if i < 3 else f'`{i + 1}.`'} {names[uid]} — **{score:.1f}** {label_points} "
+            f"{tier(score, formula)[0][1]} "
             f"({fmt(total, unit)} total)"
             for i, (score, total, uid) in enumerate(ranked)
         ]
@@ -356,15 +601,16 @@ async def ipf_leaderboard(interaction: discord.Interaction, category: str, membe
     await interaction.response.send_message(embed=embed)
 
 
-def tier_list() -> str:
+def tier_list(formula: Optional[str] = None) -> str:
+    """Tier floors for one formula, or for both side by side."""
     lines = []
-    for i, (name, emoji, _, low) in enumerate(scoring.TIERS):
-        span = f"{low}+" if i == len(scoring.TIERS) - 1 else f"{low}–{scoring.TIERS[i + 1][3]}"
-        lines.append(f"{emoji} **{name}** — {span} GL")
+    for name, emoji, _, floors in scoring.TIERS:
+        shown = [formula] if formula else list(FORMULAS)
+        lines.append(f"{emoji} **{name}** — " + " / ".join(f"{floors[f]}+ {SCORE_LABEL[f]}" for f in shown))
     return "\n".join(lines)
 
 
-@bot.tree.command(name="ranking", description="Your rank tier, from Bronze to Ascender, based on IPF GL points")
+@bot.tree.command(name="ranking", description="Your rank tier, from Bronze to Ascender, based on GL or DOTS points")
 @app_commands.guild_only()
 @app_commands.describe(member="See someone else's rank instead")
 async def ranking(interaction: discord.Interaction, member: Optional[discord.Member] = None):
@@ -374,6 +620,8 @@ async def ranking(interaction: discord.Interaction, member: Optional[discord.Mem
         await interaction.response.send_message(f"{target.display_name} hasn't run `/setup` yet.", ephemeral=True)
         return
 
+    formula = viewer_prefs(interaction)[1]
+    label = SCORE_LABEL[formula]
     result = best_total(db.best_lifts(interaction.guild_id, target.id))
     if result is None:
         embed = discord.Embed(
@@ -382,42 +630,43 @@ async def ranking(interaction: discord.Interaction, member: Optional[discord.Mem
                         "Estimated maxes from `/set` don't count.",
             color=discord.Color.light_grey(),
         )
-        embed.add_field(name="Tiers", value=tier_list(), inline=False)
+        embed.add_field(name="Tiers", value=tier_list(formula), inline=False)
         await interaction.response.send_message(embed=embed)
         return
 
     unit = lifter["unit"]
     total, bodyweight = result
-    score = gl_points(total, bodyweight, lifter["sex"])
-    (name, emoji, color, low), up = tier(score)
+    score = points(total, bodyweight, lifter["sex"], formula)
+    (name, emoji, color, low), up = tier(score, formula)
     embed = discord.Embed(
         title=f"{emoji} {target.display_name} — {name}",
-        description=f"**{score:.1f} GL** from a {fmt(total, unit)} total at {fmt(bodyweight, unit)}",
+        description=f"**{score:.1f} {label}** from a {fmt(total, unit)} total at {fmt(bodyweight, unit)}",
         color=discord.Color(color),
     )
     if up:
         next_name, next_emoji, _, next_low = up
         filled = int((score - low) / (next_low - low) * 10)
-        need = total_for_gl(next_low, bodyweight, lifter["sex"]) - total
+        need = total_for_points(next_low, bodyweight, lifter["sex"], formula) - total
         embed.add_field(
-            name=f"Next: {next_emoji} {next_name} ({next_low} GL)",
-            value=f"{'▰' * filled}{'▱' * (10 - filled)} {next_low - score:.1f} GL to go\n"
+            name=f"Next: {next_emoji} {next_name} ({next_low} {label})",
+            value=f"{'▰' * filled}{'▱' * (10 - filled)} {next_low - score:.1f} {label} to go\n"
                   f"About {fmt(need, unit)} more on your total at this bodyweight.",
             inline=False,
         )
     else:
         embed.add_field(name="Top tier", value="Nowhere left to climb. That's world-class lifting.", inline=False)
-    embed.add_field(name="Tiers", value=tier_list(), inline=False)
-    embed.set_footer(text="Ranks use logged 1 rep maxes only, scored with IPF GL points.")
+    embed.add_field(name="Tiers", value=tier_list(formula), inline=False)
+    embed.set_footer(text=f"Ranks use logged 1 rep maxes only, scored with {FORMULAS[formula]}. "
+                          "Switch formulas in /setting.")
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="faq", description="How the bot works, how to get started, and how IPF GL points are calculated")
+@bot.tree.command(name="faq", description="How the bot works, how to get started, and how GL and DOTS points work")
 async def faq(interaction: discord.Interaction):
     (ma, mb, mc), (fa, fb, fc) = scoring.MALE, scoring.FEMALE
     embed = discord.Embed(
         title="Pepcebo FAQ",
-        description="Track your squat, bench, and deadlift, see your total and IPF GL points, "
+        description="Track your squat, bench, and deadlift, see your total and IPF GL or DOTS points, "
                     "and compare yourself with this server, every Pepcebo user, or real IPF lifters.",
         color=discord.Color.gold(),
     )
@@ -425,22 +674,31 @@ async def faq(interaction: discord.Interaction):
         name="🚀 Getting started",
         value="1. `/setup` — enter your sex, bodyweight, and unit (lb or kg).\n"
               "2. `/pr` — log your best single (1 rep max) for squat, bench, and deadlift.\n"
-              "3. `/stats` — see your bests, total, and IPF GL points.\n"
+              "3. `/stats` — see your bests, total, points, and rank.\n"
               "4. `/leaderboard` and `/ranking` — see where you stand.",
         inline=False,
     )
     embed.add_field(
         name="📋 Commands",
-        value="`/setup` — rerun any time your bodyweight changes. Each lift keeps the bodyweight "
-              "you had when you logged it, so old GL scores don't shift.\n"
-              "`/pr lift weight` — log a single. A new best is announced as a PR; anything lower is "
-              "still saved but your best stays the same.\n"
+        value="`/setup` — sex, bodyweight, and unit.\n"
+              "`/setting` — update your bodyweight, unit, or scoring formula, and pick a progress graph "
+              "(bodyweight or any lift). Each lift keeps the bodyweight you had when you logged it.\n"
+              "`/pr lift weight` — log a single. A new best is announced as a PR.\n"
               "`/set lift 225 x 5` — log a rep set and get an estimated max (see below).\n"
-              "`/stats [member]` — bests, estimated maxes, total, GL points, rank, and bodyweight.\n"
+              "`/stats [member]` — bests, estimated maxes, total, points, rank, and bodyweight.\n"
               "`/history lift [member]` — a chart of that lift over time.\n"
               "`/leaderboard scope [category] [member]` — top 10 lists (see below).\n"
               "`/ranking [member]` — your rank tier.\n"
               "`/faq` — this page.",
+        inline=False,
+    )
+    embed.add_field(
+        name="🧰 Calculators",
+        value="`/attempts lift [target]` — 1st, 2nd, and 3rd meet attempts: opener ≈ 91%, second ≈ 96%, "
+              "third = your target. Leave `target` empty to plan around your logged best. For `total`, "
+              "the target is split across the lifts like your current bests.\n"
+              "`/1rm weight reps` — your estimated max by seven standard formulas, plus a rep max "
+              "and percentage chart. Nothing gets logged.",
         inline=False,
     )
     embed.add_field(
@@ -453,26 +711,30 @@ async def faq(interaction: discord.Interaction):
     )
     embed.add_field(
         name="🎖️ Ranking tiers",
-        value="Your rank comes from your IPF GL points (logged singles only):\n" + tier_list(),
+        value="Your rank comes from your points (logged singles only), in the formula you picked:\n" + tier_list(),
         inline=False,
     )
     embed.add_field(
         name="🏆 Leaderboards",
-        value="**`scope: server`** — top 10 in this Discord server. `total` is ranked by IPF GL points "
+        value="**`scope: server`** — top 10 in this Discord server. `total` is ranked by points "
               "(you need all three lifts logged); `squat`, `bench`, or `deadlift` are ranked by weight.\n"
               "**`scope: global`** — the same, but across everyone using Pepcebo in every server. "
               "If you're in several servers, your best profile counts.\n"
-              "**`scope: ipf`** — top 10 all-time raw IPF lifters in your weight class (from your "
+              "**`scope: professional`** — top 10 all-time raw IPF lifters in your weight class (from your "
               "bodyweight when you logged the lift), plus the percentage of them you beat. Uses best results from raw "
               "full-power IPF meets via OpenIPF. Competition lifts are judged, so treat it as a rough guide.",
         inline=False,
     )
     embed.add_field(
-        name="📐 What are IPF GL points?",
-        value="The International Powerlifting Federation's formula for comparing lifters of different "
-              "bodyweights. Heavier lifters lift more but not proportionally more, so GL scores your "
-              "total against what's expected at your bodyweight. A higher score is better, no matter "
-              "your weight class. Roughly: **~100+** is world-class; most gym lifters are well below.",
+        name="📐 GL or DOTS?",
+        value="Both compare lifters of different bodyweights. Heavier lifters lift more but not "
+              "proportionally more, so each scores your total against what's expected at your bodyweight. "
+              "**IPF GL** (the default) is the IPF's official formula; **~100+** is world-class. "
+              "**DOTS** is used by many other federations and runs about 5× higher; **~500+** is world-class. "
+              "They rank people almost the same way. Pick one in `/setting`; leaderboards and ranks "
+              "show in the formula of whoever looks at them.\n"
+              "DOTS = total × 500 / (a·bw⁴ + b·bw³ + c·bw² + d·bw + e), bodyweight capped at 40–210 kg "
+              "(men) or 40–150 kg (women).",
         inline=False,
     )
     embed.add_field(
