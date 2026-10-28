@@ -465,6 +465,92 @@ async def stats(interaction: discord.Interaction, member: Optional[discord.Membe
     await interaction.response.send_message(embed=embed)
 
 
+def compare_side(guild_id, user_id, sex: str, formula: str) -> dict:
+    """{lift or "total": (kg, × bodyweight)} for what's logged, plus "points" (or None)."""
+    bests = db.best_lifts(guild_id, user_id)
+    side = {lift: (b.weight_kg, b.weight_kg / b.bodyweight_kg) for lift, b in bests.items()}
+    result = best_total(bests)
+    side["points"] = None
+    if result:
+        total, bodyweight = result
+        side["total"] = (total, total / bodyweight)
+        side["points"] = points(total, bodyweight, sex, formula)
+    return side
+
+
+def compare_row(label: str, a, b, digits: int, suffix: str = "") -> str:
+    cells = [f"{v:.{digits}f}{suffix}" if v is not None else "—" for v in (a, b)]
+    diff = f"{a - b:+.{digits}f}" if a is not None and b is not None else ""
+    return f"{label:<9}{cells[0]:>8}{cells[1]:>8}{diff:>9}"
+
+
+@bot.tree.command(name="compare", description="Head-to-head: lifts, bodyweight ratios, and points side by side")
+@app_commands.guild_only()
+@app_commands.describe(member="Who to compare against you", other="Compare member with this person instead of you")
+async def compare(interaction: discord.Interaction, member: discord.Member, other: Optional[discord.Member] = None):
+    left, right = (member, other) if other else (interaction.user, member)
+    if left.id == right.id:
+        await interaction.response.send_message("Pick two different people.", ephemeral=True)
+        return
+    lifters = [db.get_lifter(interaction.guild_id, person.id) for person in (left, right)]
+    for person, lifter in zip((left, right), lifters):
+        if lifter is None:
+            await interaction.response.send_message(f"{person.display_name} hasn't run `/setup` yet.", ephemeral=True)
+            return
+
+    unit, formula = viewer_prefs(interaction)
+    a, b = (compare_side(interaction.guild_id, p.id, l["sex"], formula) for p, l in zip((left, right), lifters))
+    names = ["You" if p == interaction.user else p.display_name for p in (left, right)]
+    # Backticks would break out of the code block
+    short = [n.replace("`", "'")[:7] for n in names]
+
+    def kg(side, key):
+        return from_kg(side[key][0], unit) if key in side else None
+
+    def ratio(side, key):
+        return side[key][1] if key in side else None
+
+    rows = [f"{'':9}{short[0]:>8}{short[1]:>8}{'Diff':>9}"]
+    for key in LIFTS + ("total",):
+        rows.append(compare_row(key.title(), kg(a, key), kg(b, key), 1))
+        rows.append(compare_row("  × BW", ratio(a, key), ratio(b, key), 2, "×"))
+    rows.append(compare_row(SCORE_LABEL[formula], a["points"], b["points"], 1))
+    rows.append(compare_row("BW now", *(from_kg(l["bodyweight_kg"], unit) for l in lifters), 1))
+
+    # Who's ahead: lift by lift, then on points
+    summary = []
+    shared = [l for l in LIFTS if l in a and l in b]
+    wins = [sum(1 for l in shared if side[l][0] > other_side[l][0]) for side, other_side in ((a, b), (b, a))]
+    on = "on lifts" if len(shared) == len(LIFTS) else "on the lifts you've both logged" if left == interaction.user \
+        else "on the lifts they've both logged"
+    names = [discord.utils.escape_markdown(n) for n in names]
+    if shared:
+        if wins[0] == wins[1]:
+            summary.append(f"Split {wins[0]}–{wins[1]} {on}.")
+        else:
+            lead = 0 if wins[0] > wins[1] else 1
+            summary.append(f"**{names[lead]}** {'win' if names[lead] == 'You' else 'wins'} "
+                           f"{max(wins)}–{min(wins)} {on}.")
+    if a["points"] is not None and b["points"] is not None:
+        diff = a["points"] - b["points"]
+        lead = 0 if diff >= 0 else 1
+        (tier_a, tier_b) = (tier(s["points"], formula)[0] for s in (a, b))
+        summary.append(f"**{names[lead]}** {'lead' if names[lead] == 'You' else 'leads'} by "
+                       f"**{abs(diff):.1f} {SCORE_LABEL[formula]}** "
+                       f"({tier_a[1]} {tier_a[0]} vs {tier_b[1]} {tier_b[0]}).")
+    else:
+        summary.append("Points need all three lifts logged by both people.")
+
+    embed = discord.Embed(
+        title=f"{names[0]} vs {names[1]}",
+        description="```\n" + "\n".join(rows) + "\n```" + " ".join(summary),
+        color=discord.Color.gold(),
+    )
+    embed.set_footer(text=f"Weights in {unit}. × BW is the lift divided by the bodyweight it was logged at. "
+                          "Logged singles only.")
+    await interaction.response.send_message(embed=embed)
+
+
 @bot.tree.command(name="leaderboard", description="Leaderboard for this server, all bot users, or IPF lifters")
 @app_commands.guild_only()
 @app_commands.describe(
@@ -686,6 +772,7 @@ async def faq(interaction: discord.Interaction):
               "`/pr lift weight` — log a single. A new best is announced as a PR.\n"
               "`/set lift 225 x 5` — log a rep set and get an estimated max (see below).\n"
               "`/stats [member]` — bests, estimated maxes, total, points, rank, and bodyweight.\n"
+              "`/compare member [other]` — head-to-head lifts, bodyweight ratios, and points.\n"
               "`/history lift [member]` — a chart of that lift over time.\n"
               "`/leaderboard scope [category] [member]` — top 10 lists (see below).\n"
               "`/ranking [member]` — your rank tier.\n"

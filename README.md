@@ -9,6 +9,7 @@ Pepcebo is a Discord bot for tracking powerlifting PRs. You log your squat, benc
 - `/pr` logs a single (1 rep max). If it beats your old best, the bot announces it as a PR.
 - `/set` logs a rep set like `225 x 5` and estimates your max from it (see below).
 - `/stats` shows your bests, estimated maxes, total, points, rank, and bodyweight. You can pass a member to see someone else's.
+- `/compare` puts two lifters side by side: squat, bench, deadlift, and total, each as a bodyweight multiple (like 2.5× BW), plus points and the difference for each. With one member it compares them with you; with two it compares them with each other.
 - `/history` sends a chart of one lift over time, with your logged singles and your estimated maxes as separate lines.
 - `/leaderboard` shows a top 10. The scope can be `server`, `global`, or `professional` (raw IPF meet lifters), and the category can be total or a single lift.
 - `/ranking` shows your rank tier (Bronze up to Ascender) and how far you are from the next one.
